@@ -1,4 +1,4 @@
-// server.js - Express + Playwright Proxy with retry
+// server.js - Express + Playwright Proxy (stable, v1.55.1)
 import express from "express";
 import cors from "cors";
 import { chromium } from "playwright";
@@ -16,8 +16,9 @@ const REFERER = "https://www.sportslottery.com.tw/sportsbook/daily-coupons";
 const ORIGIN  = "https://www.sportslottery.com.tw";
 const UA      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
 
-// ---------- 單例瀏覽器 + 自動重啟 ----------
+// ---------- 單例 Browser + Context ----------
 let browser = null;
+let context = null;
 let launching = null;
 
 async function launchBrowser() {
@@ -29,26 +30,48 @@ async function launchBrowser() {
       "--disable-dev-shm-usage",
       "--disable-accelerated-2d-canvas",
       "--disable-gpu",
-      "--no-zygote",
-      "--single-process"
+      "--no-zygote"
     ]
   });
   b.on("disconnected", () => {
     browser = null;
+    context = null;
   });
   return b;
 }
 
-async function getBrowser() {
-  if (browser) return browser;
-  if (launching) return launching;
-  launching = launchBrowser()
-    .then(b => (browser = b))
-    .finally(() => (launching = null));
-  return launching;
+async function ensureContext() {
+  if (!browser) {
+    if (!launching) {
+      launching = launchBrowser().then(b => (browser = b)).finally(() => (launching = null));
+    }
+    await launching;
+  }
+  if (!browser) throw new Error("browser launch failed");
+
+  if (!context) {
+    context = await browser.newContext({
+      userAgent: UA,
+      extraHTTPHeaders: {
+        accept: "application/json, text/plain, */*",
+        origin: ORIGIN,
+        referer: REFERER
+      }
+    });
+    // 初始化 cookie
+    const p = await context.newPage();
+    try {
+      await p.goto(REFERER, { waitUntil: "domcontentloaded", timeout: 15_000 }).catch(()=>{});
+      await p.waitForLoadState("networkidle", { timeout: 6_000 }).catch(()=>{});
+      await p.waitForTimeout(800);
+    } finally {
+      await p.close().catch(()=>{});
+    }
+  }
+  return context;
 }
 
-// ---------- 序列佇列 ----------
+// ---------- 序列化 ----------
 let queue = Promise.resolve();
 function inQueue(fn) {
   const run = () => fn().catch(e => { throw e; });
@@ -56,40 +79,26 @@ function inQueue(fn) {
   return queue;
 }
 
-// ---------- 基本路由 ----------
+// ---------- 健康檢查 ----------
 app.get("/", (_req, res) => res.type("text/plain").send("sportslottery-proxy is running. Try POST /daily"));
 app.get("/ping", (_req, res) => res.send("pong 🏓"));
-app.get("/health", (_req, res) => res.json({ ok: true, browser: !!browser }));
+app.get("/health", (_req, res) => res.json({ ok: true, browser: !!browser, context: !!context }));
 
-// ---------- 核心函式：跑一次 daily ----------
-async function runDailyOnce(incoming) {
-  const br = await getBrowser();
-  if (!br) throw new Error("browser not available");
-
-  const ctx = await br.newContext({
-    userAgent: UA,
-    extraHTTPHeaders: {
-      accept: "application/json, text/plain, */*",
-      origin: ORIGIN,
-      referer: REFERER
-    }
-  });
-  const page = await ctx.newPage();
-
+// ---------- 執行一次請求 ----------
+async function runOnce(incoming) {
+  const ctx = await ensureContext();
+  let page = null;
   try {
+    page = await ctx.newPage();
     await page.route("**/*", (route) => {
       const t = route.request().resourceType();
       if (["image", "stylesheet", "font", "media"].includes(t)) return route.abort();
       return route.continue();
     });
 
-    await page.goto(REFERER, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
-    await page.waitForLoadState("networkidle", { timeout: 6000 }).catch(()=>{});
-    await page.waitForTimeout(800);
-
     return await page.evaluate(async ({ TARGET, incoming }) => {
       const ac = new AbortController();
-      const t = setTimeout(() => ac.abort("fetch-timeout"), 25000);
+      const t = setTimeout(() => ac.abort("fetch-timeout"), 25_000);
       try {
         const r = await fetch(TARGET, {
           method: "POST",
@@ -112,12 +121,11 @@ async function runDailyOnce(incoming) {
       }
     }, { TARGET, incoming });
   } finally {
-    await page.close().catch(()=>{});
-    await ctx.close().catch(()=>{});
+    if (page) await page.close().catch(()=>{});
   }
 }
 
-// ---------- /daily 路由：自動重試一次 ----------
+// ---------- /daily ----------
 app.post("/daily", async (req, res) => {
   inQueue(async () => {
     const incoming = Object.keys(req.body || {}).length
@@ -128,22 +136,23 @@ app.post("/daily", async (req, res) => {
         };
 
     try {
-      let result = await runDailyOnce(incoming);
+      let result = await runOnce(incoming);
 
-      // 如果瀏覽器掛掉 → 重啟再試一次
-      if (!result.ok || /Target page|browser has been closed/.test(result.error || "")) {
-        console.warn("browser crash, retrying once...");
-        browser = null; // 強制重啟
-        result = await runDailyOnce(incoming);
+      if (!result?.ok || /Target page|browser has been closed|fetch-timeout/i.test(result?.error || "")) {
+        console.warn("first attempt failed; restarting browser and retrying...");
+        try { if (context) await context.close().catch(()=>{}); } catch {}
+        try { if (browser) await browser.close().catch(()=>{}); } catch {}
+        browser = null; context = null;
+        result = await runOnce(incoming);
       }
 
-      if (!result.ok) {
-        return res.status(500).json({ error: "browser fetch failed", detail: result.error || "unknown" });
+      if (!result?.ok) {
+        return res.status(500).json({ error: "browser fetch failed", detail: result?.error || "unknown" });
       }
 
       res.status(result.status)
-        .set("content-type", result.ct || "application/json; charset=utf-8")
-        .send(result.text);
+         .set("content-type", result.ct || "application/json; charset=utf-8")
+         .send(result.text);
 
     } catch (e) {
       console.error("daily error:", e);
@@ -154,6 +163,5 @@ app.post("/daily", async (req, res) => {
   });
 });
 
-// ---------- 啟動 ----------
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("proxy up on :" + port));
