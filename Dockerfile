@@ -1,9 +1,9 @@
-# Playwright official image with Chromium installed
-FROM mcr.microsoft.com/playwright:v1.47.2-jammy
+# Match Playwright version in image (1.55.1)
+FROM mcr.microsoft.com/playwright:v1.55.1-jammy
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
-# Use npm install (not npm ci) since repo may not include package-lock.json
+# Use npm install (no lockfile required)
 RUN npm install --omit=dev
 
 COPY . .
