@@ -7,6 +7,7 @@
     "playwright": "^1.47.2"
   },
   "scripts": {
+    "postinstall": "playwright install --with-deps chromium",
     "start": "node server.js"
   }
 }
