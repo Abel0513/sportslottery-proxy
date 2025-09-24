@@ -1,0 +1,12 @@
+{
+  "name": "sportslottery-proxy",
+  "type": "module",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "playwright": "^1.47.2"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
